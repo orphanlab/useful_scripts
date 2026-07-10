@@ -6,5 +6,5 @@ Note that these are NOT meant to be run directly, and likely need a fair bit of 
 
 To recap:
 
-** do not expect to apply these to your data as-is, they will need modification **
-** these are potentially out of date and not the most efficient starting point **
+**do not expect to apply these to your data as-is, they will need modification**
+**these are potentially out of date and not the most efficient starting point**

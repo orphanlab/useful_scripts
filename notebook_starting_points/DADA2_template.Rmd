@@ -1,0 +1,498 @@
+---
+title: "DADA2 template"
+author: "Daniel Utter"
+date: "9/15/2025"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 5
+    toc_float:
+      collapsed: true
+
+---
+
+### Some background
+All of this assumes we're on Ocean, working in the `r_dada2` conda environment. This is an environment of the anaconda3-2019.07 instance (not the tag_conda one used for the QIIME2 workflow).
+
+**Initial setup**: make sure you connect to Ocean using [your specified port](https://docs.google.com/spreadsheets/d/1_Bc-O4CEwxhL-UjklOEvjyEWTD_IG0O-BcV-lH_jpdc/edit#gid=0), sign up if you don't have one yet. Example for Mac: `ssh -L 8080:localhost:8080 dutter@ocean.caltech.edu`. 
+
+Then, make sure the file at `/export/data1/sw/anaconda3-2019.07/envs/r_dada2/etc/conda/activate.d/activate-interactive-ports.sh` has your name in it. If your name is missing, open the file with nano or vi, copy/paste a line that you can edit to be in the form `[[ "$(whoami)" = "OCEAN_USERNAME" ]] && export R_PORT=NNNN` where `OCEAN_USERNAME` is your ocean logon username (like `dutter`) and `NNNN` is your assigned port number you chose. If you did this while the environment was active, you'll need to deactivate & reactivate the conda env for it to take effect. Alternatively, try `echo "export R_PORT=NNNN" > ~/.bashrc` (changing NNNN to your port) and then re-login or `source ~/.bashrc`
+
+**Usage instructions**: 
+
+0a. **IMPORTANT** This is *only* for Laragen (old MiSeq) data. DO NOT USE WITH NEW NEXTSEQ (UC DAVIS)! for TAG data sequenced on a NextSeq (i.e. anything 2026 and forward, and some of 2025) use `DADA2_template_nextseq.Rmd`
+0.b Connect to Ocean, forwarding your port. On a Mac this is like `ssh -L PORT:localhost:PORT USER@ocean.caltech.edu`, for Windows check the PuTTY docs for a guide or use MobaXterm.
+1. Make a copy of this template script (located at `/export/data1/db/16S_tag_processing_db/DADA2_template.Rmd`) into your project analysis directory (e.g. `/data1/projects/dutter/ml_mixing/`) and then work with the copy. If you are in Rstudio on Ocean right now, you can use the "File / Save As" dialog.
+2. Run `conda activate r_dada2` and finally `rstudio-server-wrapper.sh`. This launches RStudio Server (very similar to jupyter). 
+3. Open a browser tab to `localhost:PORT` or whatever local port you forwarded to, and you will get an interactive notebook for the rest of this. Tweak the initial two code blocks as needed to point to your files, and then run the rest unless you want to modify any parameters.
+
+If you are reading this from the Dropbox static HTML, you can copy/paste from this but you are **strongly** recommended to use this template via R on Ocean (steps 2-3) once you are setup.
+
+Overall workflow taken from [the DADA2 recommendations](https://benjjneb.github.io/dada2/tutorial.html) and borrowing parameters from Rebecca W.'s Orphan lab QIIME2 workflow.
+
+### Set working directory
+
+Working directory will probably default to home (`/home/USERNAME`) so update it to your project directory. Make sure you run the `setwd(...)` block below in the console (required for the bash blocks later).
+
+```{r setup, include=T}
+working_dir=paste0("/export/home/dutter")
+
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = working_dir)
+
+### RUN THIS LINE IN THE CONSOLE AGAIN:
+setwd(working_dir)
+```
+
+### Cutadapt
+
+How this works: the `ls /data1/data/...` bit points to the raw data to be analyzed (so we're not copying it needlessly). Ideally we keep all the original data **untouched** in `/data1/data/Tag_*`, but the path can be adjusted. Note that it should list only the R1 files (so we don't run twice). 
+
+Make sure the file paths it prints out are the R1 for the samples you want...
+
+```{bash eval=F}
+MY_FILES=$(ls /export/data1/data/Tag_2021Jun*/MLW*R1*) #/MLW*0521*R1*) #/MLW*R1*gz)  ### EDIT THIS FOR YOUR SAMPLES!!
+echo -e "Today we are analyzing:\n\n$MY_FILES"
+echo ""
+mkdir -p fastq_cutadapt  # to make the directory where cutadapt-processed files will go
+
+F515="GTGYCAGCMGCCGCGGTAA"
+F515_RC="TTACCGCGGCKGCTGRCAC"
+R926="CCGYCAATTYMTTTRAGTTT"
+R926_RC="AAACTYAAAKRAATTGRCGG"
+R806="GGACTACNVGGGTWTCTAAT"
+R806_RC="ATTAGAWACCCBNGTAGTCC"
+
+for R1 in $MY_FILES; do 
+R2=$(echo $R1 | sed 's/_R1_/_R2_/')
+
+# ORPHAN 515f-926r
+cutadapt -a ^${F515}...${R926_RC} -A ^${R926}...${F515_RC} --discard-untrimmed -m 100 -j 4 -o fastq_cutadapt/$(basename $R1) -p fastq_cutadapt/$(basename $R2) $R1 $R2
+
+# SHANA 515f-806r
+#cutadapt -a ^${F515}...${R806_RC} -A ^${R806}...${F515_RC} --discard-untrimmed -m 80 -j 4 -o fastq_cutadapt_1/$(basename $R1) -p fastq_cutadapt_1/$(basename $R2) $R1 $R2
+
+done
+```
+
+### Main DADA2 workflow
+
+#### Reading in data
+Read in data. The last `gsub` line sets the sample names by trimming off the general filename junk (`S00_L001_R2.fastq.gz`) but modify as needed if you have identical prefixes in across different libraries, etc.
+```{r message=F, results='hide', warning=F, eval=T}
+library(dada2)
+library(ggplot2)
+library(reshape2)
+library(dplyr)
+
+forward_reads <- list.files("fastq_cutadapt", pattern="R1_001", full.names = T)
+reverse_reads <- list.files("fastq_cutadapt", pattern="R2_001", full.names = T)
+
+# this is names of files where filtered forward reads will be saved to, they're not filtered yet
+filtered_forward_reads <- gsub("_001.fastq","_filtered.fastq", forward_reads)
+filtered_reverse_reads <- gsub("_001.fastq","_filtered.fastq", reverse_reads)
+
+# set up sample names - double check it stripped off the junk appropriately
+samples <- gsub("^.*/","",
+                gsub("_S[0-9]*_L.*$", "", filtered_forward_reads)) ## MODIFY IF NEEDED
+print(samples)
+```
+
+Can plot a few to get an idea of what quality scores look like:
+
+```{r warning=F, message=F, eval=T}
+plotQualityProfile(forward_reads[1:min(2, length(forward_reads))]) + 
+  geom_vline(xintercept = 240, col='black', lty=2) +
+  geom_hline(yintercept = 30, col='grey60', lty=3)
+plotQualityProfile(reverse_reads[1:min(2, length(forward_reads))]) + 
+  geom_vline(xintercept = 200, col='red', lty=2) +
+  geom_hline(yintercept = 30, col='grey60', lty=3)
+```
+
+#### OPTIONAL: quantitatively figure out trim lengths
+Skip this if uninterested in optimizing read lengths
+```{r message=F, eval=T, error=F, warning=F}
+get_stats_for_fastq <- function(raw_fastq, qthresh=30, n_subset=1e5) {
+  quals <- ShortRead::qa(dirPath = raw_fastq, n=1e5)[['perCycle']]$quality
+
+  quals <- quals %>% group_by(lane, Cycle) %>% summarise(long_score = rep(Score, Count)) %>% 
+    summarise(mean_score = mean(long_score), sd_score=sd(long_score), med_score = median(long_score),
+              mad_score=stats::mad(long_score, constant = 1))
+
+  quals$quality <- 'good_quality'
+  quals$quality[quals$mean_score < qthresh] <- 'bad_quality'
+  
+  quals$lane <- factor(quals$lane, levels = unique(c(grep("_R1_", quals$lane, value=T), grep("_R2_", quals$lane, value=T))))
+
+  return(quals)
+}
+
+diving_deriv <- function(df, thresh=-0.06) {
+  x <- predict(loess(mean_score~Cycle, df))  # loess smooth out the jitters
+  y <- df$Cycle
+  
+  fderiv <- diff(x) / diff(y)
+  
+  possibles <- which(fderiv < thresh)
+  
+  return(min(possibles))
+}
+```
+
+Pick a quality threshold (30 is conventional), and label each position as being good or bad quality, based on each position's mean quality score being at least or below the threshold. Then do some metrics to figure out where quality starts to dip: 
+ * first position with bad quality 
+ * last position with bad quality 
+ * middle between first and last, 
+ * Estimate based on the position where 1st derivative starts decreasing quickly (very cautious)
+ 
+```{r message=F, error=F, warning=F, eval=T}
+quality_thresh <- 30
+
+stats_quality <- get_stats_for_fastq(c(forward_reads[1:3], reverse_reads[1:3]), qthresh = quality_thresh)
+
+first_bad <- sapply(levels(stats_quality$lane), function(x) 
+  min(stats_quality$Cycle[stats_quality$quality == 'bad_quality' & (stats_quality$lane == x)]))
+last_good <- sapply(levels(stats_quality$lane), function(x) 
+  max(stats_quality$Cycle[stats_quality$quality == 'good_quality' & (stats_quality$lane == x)]))
+middle <- first_bad + floor((last_good - first_bad)/2)
+estimated <- sapply(levels(stats_quality$lane), 
+                    function(x) diving_deriv(stats_quality[stats_quality$lane == x,], thresh = -0.06))
+
+summary_df <- data.frame(lane=names(estimated), first_bad=first_bad, middle=middle, last_good=last_good, estimated=estimated)
+summary_df$lane <- factor(summary_df$lane, 
+                             levels = unique(c(grep("_R1_", summary_df$lane, value=T), 
+                                               grep("_R2_", summary_df$lane, value=T))))
+
+print(summary_df, row.names = F)
+
+ggplot(stats_quality, aes(x=Cycle, y= mean_score)) + 
+  geom_linerange(aes(ymin=mean_score - sd_score, ymax=mean_score + sd_score)) + 
+  geom_point(pch="_", aes(color=quality)) +
+  facet_wrap(~lane, ncol=3) +
+  geom_hline(yintercept = 30, color='grey20', lty=2) +
+  geom_vline(data=summary_df, aes(xintercept=first_bad), color='blue', lty=3) +
+  geom_vline(data=summary_df, aes(xintercept=middle), color='grey50', lty=3) +
+  geom_vline(data=summary_df, aes(xintercept=last_good), color='red', lty=3) +
+  geom_vline(data=summary_df, aes(xintercept=estimated), color='cyan', lty=3) +
+  theme_classic()
+```
+
+#### Filter & error rates
+Note that this step defaults to the standard Orphan lab parameters for trimming (`truncLen=`), 240bp forward / 200bp reverse. If you dislike this (or finished and are dissatisfied with the results), run the previous section to optimize this step.
+
+```{r eval=T}
+filtered_out <- filterAndTrim(forward_reads, filtered_forward_reads,
+                reverse_reads, filtered_reverse_reads, maxEE=c(2,2),
+                rm.phix=TRUE, minLen=150, truncLen=c(240,200))
+
+cbind(filtered_out, perc_kept = filtered_out[,2]/filtered_out[,1])
+```
+
+
+#### Estimate error models & denoise (make ASVs)
+Using the filtered reads generated in the last step, this next chunk will estimate the error rates from our data (default assumption is that all samples are equivalent in error profile, if this is not the case there are parameters that can be adjusted). Sequences are then dereplicated which `dada()` uses with the error model to define ASVs and discard erroneous variants. 
+
+```{r eval=T}
+err_forward_reads <- learnErrors(filtered_forward_reads, multithread=8)
+err_reverse_reads <- learnErrors(filtered_reverse_reads, multithread=8)
+
+derep_forward <- derepFastq(filtered_forward_reads, verbose=FALSE)
+derep_reverse <- derepFastq(filtered_reverse_reads, verbose=FALSE)
+
+# the sample names in these objects are initially the file names, this sets them to the sample names
+names(derep_forward) <- gsub("^.*/","", gsub("_S[0-9]*_.*$", "", filtered_forward_reads)) 
+names(derep_reverse) <- gsub("^.*/","",gsub("_S[0-9]*_.*$", "", filtered_forward_reads))
+
+# actual DADA2 denoising step
+dada_forward <- dada(derep_forward, err=err_forward_reads, pool="pseudo", multithread=8)
+dada_reverse <- dada(derep_reverse, err=err_reverse_reads, pool="pseudo", multithread=8)
+```
+
+#### Merge and chimera cleaning
+This step merges the denoised forward and reverse reads. The `trimOverhang` parameter is probably not relevant as that's only if your overlap is so much that your reverse goes past the start of your forward (can lead to wonky things if you read through the primer etc and pre-trimming didn't go well). 
+
+NB: `minOverlap` can make a LOT of difference in read retention. If trim lengths are `240 + 200` and biological amplicon size is `440`, you're in for a bad time. If physical amplicon size is `415`, life is especially bad bad, because biology is variable so organisms with expected or shorter amplicon sizes are great, but any organism with a single insertion in your amplicon length will get dropped. So pick a conservative number, but not too conservative that you get spurious merges :) Current primers in the lab should be amplifying something ~400, so we have a wiggle room of 38bp for merging with default parameters.
+
+```{r eval=T}
+merged_amplicons <- mergePairs(dada_forward, derep_forward, dada_reverse, derep_reverse, 
+                               trimOverhang=TRUE, minOverlap=12)
+seqtab <- makeSequenceTable(merged_amplicons)
+
+print("Merged fraction:")
+rowSums(seqtab) / rowSums(makeSequenceTable(dada_forward))
+
+seqtab.nochim <- removeBimeraDenovo(seqtab, verbose = T, method = 'consensus')
+
+print("Non-chimeric fraction:")
+sum(seqtab.nochim)/sum(seqtab)
+```
+
+### Summarize read retention by step
+Plot this summary (this makes a good supplemental figure):
+```{r eval=T, message=FALSE, warning=FALSE}
+getN <- function(x) sum(getUniques(x))
+
+summary_tab <- data.frame(row.names=samples, samp=samples, input=filtered_out[,1],
+               filtered=filtered_out[,2], dada_f=sapply(dada_forward, getN),
+               dada_r=sapply(dada_reverse, getN), merged=sapply(merged_amplicons, getN),
+               nonchim=rowSums(seqtab.nochim),
+               final_perc_reads_retained=round(rowSums(seqtab.nochim)/filtered_out[,1]*100, 1))
+
+summary_tab
+write.table(summary_tab, "read-count-tracking.tsv", quote=FALSE, sep="\t", col.names=NA)
+
+ggplot(melt(summary_tab[,-ncol(summary_tab)], variable.name='Step', value.name='Reads'), aes(x = Step, y = Reads)) +
+	#geom_bar(aes(fill = Step), stat = 'identity') + 
+  geom_boxplot(outlier.shape = NA) + geom_jitter(aes(color=samp), height=0, width=0.2) + guides(fill='none') +
+  theme_bw() + theme(axis.text.x = element_text(angle = 90, color='black', hjust=1, vjust=0.5), 
+                     axis.line.x = element_line(), axis.line.y = element_line())
+ggsave("read-count-tracking.pdf", width=8, height=6)
+
+melt(summary_tab[,-ncol(summary_tab)], variable.name='Step', value.name='Reads') %>% group_by(samp) %>%
+  mutate(Reads=Reads/Reads[Step == "input"]) %>% mutate(guess_type='sample') %>% 
+  mutate(guess_type=replace(guess_type, grep("[Bb]lank|[Cc]ont[rol]*|[Nn]eg|DNAex|50cyc",samp), 'control')) %>%
+  ggplot(aes(x = Step, y = Reads)) +
+  geom_boxplot(aes(color = guess_type), outlier.shape = NA) + theme_bw() +
+  geom_point(position=position_jitterdodge(jitter.height=0, jitter.width=0.2), aes(fill=guess_type), alpha=0.6, pch=21) +
+	theme(axis.text.x = element_text(angle = 90, color='black', hjust=1, vjust=0.5), panel.background = element_blank(),
+	      axis.line.x = element_line(), axis.line.y = element_line())
+ggsave("read-count-tracking_percent.pdf", width=8, height=6)
+```
+
+
+### Annotation
+```{r eval=F}
+library(DECIPHER)
+
+# load in the latest SILVA dataset, lives at this path on OCEAN
+# load("/export/data1/db/16S_tag_processing_db/SILVA_SSU_r138_2019.RData")  # SILVA VANILLA
+#load("/export/data1/db/16S_tag_processing_db/SILVA_SSU_r138_2019_orphanlab_k8-210919.RData")  # PREVIOUS SILVA + orphan seqs
+load("/export/data1/db/16S_tag_processing_db/CABO-16S_20250911.RData")  # CABO-16S Fall 2025
+
+## creating DNAStringSet object of our ASVs
+dna <- DNAStringSet(getSequences(seqtab.nochim))
+
+## and classify, threshold=40 means 40% confidence as some lineages would be unclassified (default 60%)
+tax_info <- IdTaxa(test=dna, trainingSet=trainingSet, strand="top", threshold=40, processors = 8)
+```
+
+Save the data as counts table and as fasta of ASV representative seqs (so you can do plots later)
+```{r eval=F}
+ # giving our seq headers more manageable names (ASV_1, ASV_2...)
+asv_seqs <- colnames(seqtab.nochim)
+asv_headers <- vector(dim(seqtab.nochim)[2], mode="character")
+
+for (i in 1:dim(seqtab.nochim)[2]) {
+  asv_headers[i] <- paste(">ASV", i, sep="_")
+}
+
+  # making and writing out a fasta of our final ASV seqs:
+asv_fasta <- c(rbind(asv_headers, asv_seqs))
+write(asv_fasta, "ASVs.fa")
+
+  # count table:
+asv_tab <- t(seqtab.nochim)
+row.names(asv_tab) <- sub(">", "", asv_headers)
+write.table(asv_tab, "ASVs_counts.tsv", sep="\t", quote=F, col.names=NA)
+
+  # tax table:
+  # creating table of taxonomy and setting any that are unclassified as "NA"
+ranks <- c("domain", "phylum", "class", "order", "family", "genus", "species")
+asv_tax <- lapply(tax_info, function(x) {
+  taxa <- unlist(strsplit(x$taxon, ";"))[-1]  # drop "Root"
+  taxa <- c(taxa, rep(taxa[length(taxa)], max(0,length(ranks)-length(taxa))))
+  taxa <- taxa[1:length(ranks)]  # pesky euks
+})
+asv_tax <- matrix(unlist(asv_tax), ncol=length(ranks), byrow = T, dimnames = list(names(asv_tax), ranks))
+colnames(asv_tax) <- ranks
+rownames(asv_tax) <- gsub(pattern=">", replacement="", x=asv_headers)
+
+write.table(asv_tax, "ASVs_taxonomy.tsv", sep = "\t", quote=F, col.names=NA)
+```
+
+
+### Example post-analysis
+This is just a suggested start to a workflow
+
+```{r message=F, warning=F, eval=T}
+library(vegan)
+library(reshape2)
+library(dendextend)
+library(tidyr)
+library(viridis)
+library(Biostrings)
+library(DECIPHER)
+```
+
+Read in the counts, taxonomy, maybe make some metadata.
+```{r eval=T, message=F, warning=F, error=F}
+counts_tab <- read.csv("ASVs_counts.tsv",header=T, row.names=1,check.names=F, sep="\t")
+relative_tab <- apply(counts_tab, 2, function(x) 100*(x/sum(x)))
+tax_tab <- read.csv("ASVs_taxonomy.tsv", header=T, row.names=1, check.names=F, sep="\t")
+tax_tab$ASV <- rownames(tax_tab)
+asv_seqs <- readDNAStringSet("ASVs.fa")
+
+stock_colors <- c("#FF0000","#F6A300","#0068CC","#6600AA","#AC0088","#AA33FF","#00FFFF","#00CC00","#006611","#00AC99",
+				 "#AC6844","#FFFF00","#991100","#ACAC11","#a0f0aa","#FF00FF","#FF8611","#B9F6F6","#001166","#AC9A00",
+				 "#994141","#ff1169","#0AF622","#119924","#Ac3311","#004A9A","#AcAc99","turquoise","tomato","sienna1",
+				 "rosybrown","peachpuff","olivedrab3","mistyrose1","mediumorchid","indianred2","#114914","#660011",
+				 "ivory3","deeppink","#331111")
+```
+
+#### Controls
+
+This is a better-than-nothing approach to using controls, but likely just a little bit of adjusting here will be very useful to you. Currently, this sorts through your sample names to look for things that look like typical Orphan-lab names for controls, and goes through the default decontam prevalence-based contamination removal step (making a few summary plots). Note that [decontam](https://benjjneb.github.io/decontam/vignettes/decontam_intro.html#identify-contaminants---frequency) does a lot better when you also provide DNA concentration information (ideally concentration after final PCR prior to pooling, but even between 1st & 2nd PCR or just post-extraction will work).
+
+NB: this assumes all samples/controls are treated equivalently (approximately same loading into PCR, same # PCR cycles, etc). For example, if using post-extraction DNA concentrations for a frequency approach, but the PCR loadings were adjusted by this, you may get weird results. It'll probably still work. But just so you know.
+
+```{r}
+predicted_controls <- grepl("[Bb]lank|[Cc]ont[rol]*|[Nn]eg|DNAex|50cyc", colnames(counts_tab))
+predicted_controls_names <- setNames(predicted_controls, colnames(counts_tab))
+conc <- c() # c(410,310,220,400,394,120)  # MAKE SURE IN SAME ORDER AS counts_tab COLUMNS
+
+if (any(predicted_controls) | (length(conc) > 1)){
+  if (length(conc) == length(colnames(counts_tab))) {
+    print('Decontam using "concentration" method')
+    contam_predict <- decontam::isContaminant(t(counts_tab), method='frequency', conc=conc) 
+    contam_asvs <- rownames(contam_predict)[contam_predict$contaminant] 
+    p <- melt(as.data.frame(cbind(t(relative_tab[contam_asvs,]), conc=conc)), id.vars = 'conc', 
+              value.name = 'relabund', variable.name = 'contam_asv') %>% filter(relabund > 0) %>% 
+      ggplot(aes(x=conc, y=relabund, color=contam_asv)) + scale_y_continuous(expand=c(0,0)) + scale_x_log10() + 
+      geom_smooth(method=stats::lm, se = F, linetype='dashed', size=0.5) + geom_point() + theme_classic()
+    print(p)
+  } else {
+    contam_predict <- decontam::isContaminant(t(counts_tab), method='prevalence', neg=predicted_controls, threshold=0.5) 
+    contam_asvs <- rownames(contam_predict)[contam_predict$contaminant] 
+  }
+  print(apply(tax_tab[contam_asvs,], 1, function(x) paste0(x, collapse=";")))
+  
+  relative_tab %>% melt(varnames = c('ASV','Sample'), value.name = 'relabund') %>% 
+    mutate(decontam=factor(setNames(contam_predict$contaminant, rownames(contam_predict))[ASV], levels=c('TRUE','FALSE'))) %>% 
+    group_by(decontam, Sample) %>% summarise(relabund=sum(relabund)) %>% ungroup() %>%
+    mutate(library_type=replace(rep("Real", length(Sample)), predicted_controls, "Control")) %>% 
+  mutate(Sample = factor(Sample, levels=unique(Sample[order(decontam,relabund)]))) %>%
+  ggplot(aes(x=Sample, y=relabund, fill=decontam)) + geom_col() + scale_fill_manual(values=c("TRUE"='#ca2a00', 'FALSE'='black')) +
+    facet_grid(.~library_type, scales='free_x', space='free_x') + scale_y_continuous(expand=c(0,0)) +
+  theme_classic() + theme(axis.text.x = element_text(angle=90, hjust=1, vjust=0.5), axis.ticks.x = element_blank())
+  
+  ## THIS WILL UPDATE THE COUNTS - running this block more than once will produce different results
+  counts_tab <- counts_tab[!(rownames(counts_tab) %in% contam_asvs),]
+  relative_tab <- apply(counts_tab, 2, function(x) 100*(x/sum(x)))
+}
+```
+
+
+
+#### Relative abundance stackbar
+Make a stackbar, as one does:
+```{r eval=T}
+relative_long <- melt(relative_tab, varnames = c("ASV","sample"), value.name = "relabund")
+
+relative_long <- cbind(relative_long, tax_tab[as.character(relative_long$ASV), 
+                                              grep("ASV", colnames(tax_tab),invert=T, value=T)])
+```
+
+Can subset (or not)
+```{r eval=T}
+sub_relative_long <- relative_long[grep("Proteo", relative_long$phylum),]
+
+ggplot(sub_relative_long, aes(x=sample, y = relabund, fill=class)) + 
+  geom_col() + scale_y_continuous(expand = c(0,0)) +
+  #facet_grid(.~year, scales = 'free_x', space = 'free_x') + 
+  scale_fill_manual(values = c(stock_colors, rep('grey', 999))) +
+  theme_classic() + theme(axis.text.x = element_text(angle=90, hjust=1, vjust=0.5))
+```
+
+#### Heatmap of ASV percent identity
+Most cases you will want to subset to taxon of interest
+```{r eval=T}
+focus_ASVs <- unique(relative_long[grep("Nitrilirupt", relative_long$family),"ASV"])
+
+asv_dist <- 100*(1- DistanceMatrix(AlignSeqs(asv_seqs[focus_ASVs]), includeTerminalGaps = F))
+asv_dist_order <- hclust(vegdist(asv_dist))
+
+asv_dist <- as.data.frame(melt(asv_dist, varnames=c("ASV1","ASV2"), value.name="percid"))
+
+asv_dist$ASV1 <- factor(asv_dist$ASV1, levels=asv_dist_order$labels[asv_dist_order$order])
+asv_dist$ASV2 <- factor(asv_dist$ASV2, levels=asv_dist_order$labels[asv_dist_order$order])
+
+asv_dist <- asv_dist[order(asv_dist$ASV1, asv_dist$ASV2),]
+
+ggplot(asv_dist, aes(x=ASV1, y=ASV2)) + 
+  geom_tile(data=asv_dist, aes(fill=percid)) + coord_equal() +
+  scale_y_discrete(expand=c(0,0)) + scale_x_discrete(expand=c(0,0)) +
+  scale_fill_gradient(low='lightgoldenrodyellow', high='red', na.value='#4a605a', name="% ID") +
+  theme_classic() + theme(axis.text.x = element_text(angle=90, vjust=0.5, hjust=1))
+
+ggtree::ggtree(asv_dist_order, ladderize = F, right = F) + 
+  ggtree::xlim(c(0, 4*mean(asv_dist_order$height))) + ggtree::geom_tiplab() +  ## comment off this line if alignment is OK
+  ggplot(asv_dist, aes(x=ASV1, y=ASV2)) + 
+  geom_tile(aes(fill=percid)) +
+  scale_y_discrete(expand=c(0,0)) + scale_x_discrete(expand=c(0,0)) +
+  scale_fill_gradient(low='lightgoldenrodyellow', high='red', na.value='#4a605a', name="% ID") +
+  theme_classic() + theme(axis.text.x = element_text(angle=90, vjust=0.5, hjust=1))
+#ggsave("working_plots/heatmap.pdf", width=8, height=7)
+```
+
+#### Or do statistical normalization + dendrogram
+
+```{r eval=T}
+library(phyloseq)
+library(DESeq2)
+deseq_counts <- DESeqDataSetFromMatrix(counts_tab, data.frame(samples=colnames(counts_tab)), design=~samples)
+deseq_counts <- estimateSizeFactors(deseq_counts, type = "poscounts")
+deseq_counts_vst <- varianceStabilizingTransformation(deseq_counts)
+vst_trans_count_tab <- assay(deseq_counts_vst)
+vst_non_neg <- vst_trans_count_tab
+vst_non_neg[vst_non_neg<0] <- 0  # this is a coercion but useful for some diversity/distance metrics
+
+  # and calculating our Euclidean distance matrix
+euc_dist <- dist(t(vst_trans_count_tab))
+euc_dend <- as.dendrogram(hclust(euc_dist, method="ward.D2"), hang=0.1)
+plot(euc_dend, ylab="VST Euc. dist.")
+```
+#### NMDS
+```{r}
+makeMDSbyLevel <- function(counts=vst_trans_count_tab, tax=tax_tab, level='ASV', distance='bray', try=100, trymax=500) {
+  counts <- cbind(tax[rownames(counts),], counts)
+  counts <- dcast(melt(counts, variable.name='sample'), sample~get(level), value.var = 'value', fun.aggregate = sum)
+  rownames(counts) <- counts$sample
+  
+  mds <- metaMDS(counts[,2:ncol(counts)], distance = distance, try = try, trymax = trymax)
+  return(mds)
+}
+
+mds <- makeMDSbyLevel(level='genus',try=100, trymax=200)
+
+# if you have sample metadata, good place to merge that onto mds table to use for coloring points
+mds_plot <- data.frame(mds$points)
+mds_plot$sample <- rownames(mds_plot)
+
+ggplot(mds_plot, aes(x=MDS1, y=MDS2)) + 
+  geom_point() + 
+  ggrepel::geom_text_repel(aes(label=sample)) +  # if a lot of samples, comment this off
+  coord_equal() + theme_bw()
+```
+
+
+
+
+### Qiime export
+Can save as biom for the qiime folks:
+```{r eval=T}
+library(biomformat)
+write_biom(make_biom(data=counts_tab), 'for_qiime_asv_counts.biom')
+write.table(cbind('Feature ID' = rownames(tax_tab), 
+                Taxon=apply(tax_tab,1, function(x) gsub(";A_.*$","", paste0(gsub("(.).*$","\\1__",colnames(tax_tab)),x,collapse = ";")))),
+          file="for_qiime_asv_tax.tsv", sep="\t", quote=F, row.names = F, col.names = T)
+```
+
+*NEED TO BE IN A DIFFERNT ENVIRONMENT* : copy/paste this into a separate terminal that is in Haley's `tag_conda` module with `qiime2-2020.11` env loaded:
+```{bash eval=F}
+qiime tools import --input-path for_qiime_asv_counts.biom --type 'FeatureTable[Frequency]' --input-format BIOMV100Format --output-path feature-table.qza
+qiime tools import --type 'FeatureData[Taxonomy]' --input-format TSVTaxonomyFormat --input-path for_qiime_asv_tax.tsv --output-path taxonomy.qza
+head -1 ASVs_counts.tsv  | tr '\t' '\n' | awk 'NR==1{print "SampleID"} NR>1{print $0}' > for_qiime_asv_metadata.txt
+
+qiime taxa barplot --i-table feature-table.qza --i-taxonomy taxonomy.qza --m-metadata-file for_qiime_asv_metadata.txt --o-visualization taxonomic_barplots.qzv
+```
+

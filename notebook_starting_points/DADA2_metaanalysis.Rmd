@@ -1,35 +1,37 @@
 ---
 title: "DADA2_metaanalysis"
-author: "Dan"
-date: "2025-12-23"
+author: "Daniel Utter, modified by Philip Woods"
+date: "2026-08-19"
 output:
   html_document:
       toc: true
       toc_depth: 4
       toc_float:
         collapsed: true
-
 ---
 
-```{r setup, include=T}
-working_dir=paste0("/export/data1/projects/dutter/random_tag/metaanalysis")
+```{r setup, include=F}
+working_dir <- paste0("/export/data1/projects/pwoods")
 
 knitr::opts_chunk$set(echo = TRUE, message=FALSE, warning=FALSE)
 knitr::opts_knit$set(root.dir = working_dir)
 
+logfile <- paste0(Sys.Date(), ".log")
+
 ### RUN THIS LINE IN THE CONSOLE AGAIN:
-#setwd(working_dir)
+setwd(working_dir)
 ```
 
-## META-ANALYSIS with DADA2
+### META-ANALYSIS with DADA2
 
 Use case is different runs with different chemistries. Historically, samples from different runs on MiSeq with Laragen have been consistent enough to not need re-running. But not necessarily so for DADA2-ing samples spanning very old (Caparaso method), 2015-2025 Laragen, and 2025+ NextSeq with UC Davis. So a way to deal with merging them is necessary.
 
-Roughly the plan is to use something analogous to the [BigData DADA2 docs](https://benjjneb.github.io/dada2/bigdata_paired.html). Rough outline is
- * standard workflow (adapted to each, i.e. Q scores, trim lengths, etc) from cutadapt -> merging the dada_F and dada_R reads
- * **Make sure to keep the final ASV nt length the same**
- * merge seq tables from each analysis into one larger seq table
- * do bimera removal, tax, etc and save
+Roughly the plan is to use something analogous to the [BigData DADA2 docs](https://benjjneb.github.io/dada2/bigdata_paired.html). Rough outline is:
+
+* standard workflow (adapted to each, i.e. Q scores, trim lengths, etc) from cutadapt -> merging the dada_F and dada_R reads
+* **Make sure to keep the final ASV nt length the same**
+* merge seq tables from each analysis into one larger seq table
+* do bimera removal, tax, etc and save
  
 So roughly:
 ```
@@ -43,9 +45,9 @@ mergeSequenceTables()
 removeBimeraDenvo()
 ```
 
+### DATASET 1 - Laragen MiSeq
 
-## DATASET 1 - Laragen MiSeq
-### Cutadapt
+#### Cutadapt
 
 How this works: the `ls /data1/data/...` bit points to the raw data to be analyzed (so we're not copying it needlessly). Ideally we keep all the original data **untouched** in `/data1/data/Tag_*`, but the path can be adjusted. Note that it should list only the R1 files (so we don't run twice). 
 
@@ -60,11 +62,34 @@ Best way to do this is make a file like `laragen_manifest.txt` with one line per
 ```
 
 ```{bash eval=F}
-MY_FILES=$(cat laragen_manifest.txt)  ### EDIT THIS FOR YOUR SAMPLES!! 
+MY_FILES=$(cat data/manifest_miseq.txt)  ### EDIT THIS FOR YOUR SAMPLES!!
 
 echo -e "Today we are analyzing:\n\n$MY_FILES"
 echo ""
 mkdir -p fastq_cutadapt_1  # to make the directory where cutadapt-processed files will go
+
+### VALIDATION PASS — run this before cutadapt to catch missing files up front
+missing_r1=()
+missing_r2=()
+
+for R1 in $MY_FILES; do
+  R2=$(echo $R1 | sed 's/_R1_001.fastq.gz/_R2_001.fastq.gz/')
+  [[ -f "$R1" ]] || missing_r1+=("$R1")
+  [[ -f "$R2" ]] || missing_r2+=("$R2")
+done
+
+echo "Checked $(echo "$MY_FILES" | wc -l) manifest entries."
+echo ""
+echo "Missing R1 (${#missing_r1[@]}):"
+printf '  %s\n' "${missing_r1[@]}"
+echo ""
+echo "Missing R2 (${#missing_r2[@]}):"
+printf '  %s\n' "${missing_r2[@]}"
+
+if [[ ${#missing_r1[@]} -gt 0 || ${#missing_r2[@]} -gt 0 ]]; then
+  echo ""
+  echo ":warning: Fix the manifest or investigate these paths before proceeding."
+fi
 
 F515="GTGYCAGCMGCCGCGGTAA"
 F515_RC="TTACCGCGGCKGCTGRCAC"
@@ -74,10 +99,10 @@ R806="GGACTACNVGGGTWTCTAAT"
 R806_RC="ATTAGAWACCCBNGTAGTCC"
 
 for R1 in $MY_FILES; do 
-R2=$(echo $R1 | sed 's/_R1_/_R2_/')
+R2=$(echo $R1 | sed 's/_R1_001.fastq.gz/_R2_001.fastq.gz/')
 
 # ORPHAN 515f-926r
-cutadapt -a ^${F515}...${R926_RC} -A ^${R926}...${F515_RC} --discard-untrimmed -m 100 -j 36 -o fastq_cutadapt_1/$(basename $R1) -p fastq_cutadapt_1/$(basename $R2) $R1 $R2
+/export/data1/sw/anaconda3-2019.07/envs/rstudio/bin/cutadapt -a ^${F515}...${R926_RC} -A ^${R926}...${F515_RC} --discard-untrimmed -m 100 -j 36 -o fastq_cutadapt_1/$(basename $R1) -p fastq_cutadapt_1/$(basename $R2) $R1 $R2
 
 # SHANA 515f-806r
 #cutadapt -a ^${F515}...${R806_RC} -A ^${R806}...${F515_RC} --discard-untrimmed -m 80 -j 24 -o fastq_cutadapt_1/$(basename $R1) -p fastq_cutadapt_1/$(basename $R2) $R1 $R2
@@ -85,10 +110,12 @@ cutadapt -a ^${F515}...${R926_RC} -A ^${R926}...${F515_RC} --discard-untrimmed -
 done
 ```
 
-### Main DADA2 workflow
+#### Main DADA2 workflow (MiSeq)
 
-#### Reading in data
+##### Reading in data
+
 Read in data. The last `gsub` line sets the sample names by trimming off the general filename junk (`S00_L001_R2.fastq.gz`) but modify as needed if you have identical prefixes in across different libraries, etc.
+
 ```{r message=F, results='hide', warning=F, eval=F}
 library(dada2)
 library(ggplot2)
@@ -104,8 +131,11 @@ filtered_reverse_reads <- gsub("_001.fastq","_filtered.fastq", reverse_reads)
 
 # set up sample names - double check it stripped off the junk appropriately
 samples <- gsub("^.*/","",
-                gsub("_S[0-9]*_L.*$", "", filtered_forward_reads)) ## MODIFY IF NEEDED
+                gsub("_S[0-9]{1,3}_(L[0-9]{3}.*|R[12]_filtered.*)$", "", filtered_forward_reads)) ## MODIFY IF NEEDED
 print(samples)
+
+capture.output(print("MiSeq samples:"), file=logfile, append=TRUE)
+capture.output(print(samples), file=logfile, append=TRUE)
 ```
 
 Can plot a few to get an idea of what quality scores look like:
@@ -119,8 +149,10 @@ plotQualityProfile(reverse_reads[1:min(2, length(forward_reads))]) +
   geom_hline(yintercept = 30, col='grey60', lty=3)
 ```
 
-#### OPTIONAL: quantitatively figure out trim lengths
+##### OPTIONAL: quantitatively figure out trim lengths
+
 Skip this if uninterested in optimizing read lengths
+
 ```{r message=F, eval=F, error=F, warning=F}
 get_stats_for_fastq <- function(raw_fastq, qthresh=30, n_subset=1e5) {
   quals <- ShortRead::qa(dirPath = raw_fastq, n=1e5)[['perCycle']]$quality
@@ -187,43 +219,50 @@ ggplot(stats_quality, aes(x=Cycle, y= mean_score)) +
   theme_classic()
 ```
 
-#### Filter & error rates
+##### Filter & error rates
+
 Note that this step defaults to the standard Orphan lab parameters for trimming (`truncLen=`), 240bp forward / 200bp reverse. If you dislike this (or finished and are dissatisfied with the results), run the previous section to optimize this step.
 
 ```{r eval=F}
 filtered_out <- filterAndTrim(forward_reads, filtered_forward_reads,
                 reverse_reads, filtered_reverse_reads, maxEE=c(2,2),
-                rm.phix=TRUE, minLen=150, truncLen=c(230,200))
+                rm.phix=TRUE, minLen=150, truncLen=c(240,200))
 
 cbind(filtered_out, perc_kept = filtered_out[,2]/filtered_out[,1])
+capture.output(cbind(filtered_out, perc_kept = filtered_out[,2]/filtered_out[,1]), file=logfile, append=TRUE)
+write.table(
+  cbind(filtered_out, perc_kept = filtered_out[,2]/filtered_out[,1]),
+  file='output/filtered_out_laragen.tsv', sep='\t', quote=F, row.names = T, col.names = NA
+  )
 ```
 
+##### Estimate error models & denoise (make ASVs)
 
-#### Estimate error models & denoise (make ASVs)
 Using the filtered reads generated in the last step, this next chunk will estimate the error rates from our data (default assumption is that all samples are equivalent in error profile, if this is not the case there are parameters that can be adjusted). Sequences are then dereplicated which `dada()` uses with the error model to define ASVs and discard erroneous variants. 
 
 ```{r eval=F}
-err_forward_reads <- learnErrors(filtered_forward_reads, multithread=24)
-err_reverse_reads <- learnErrors(filtered_reverse_reads, multithread=24)
+err_forward_reads <- learnErrors(filtered_forward_reads, multithread=16)
+err_reverse_reads <- learnErrors(filtered_reverse_reads, multithread=16)
 
 plotErrors(err_forward_reads)
-# ggsave(paste0('plots/',whose,'_F_errors.pdf'))
+ggsave(paste0('output/miseq_F_errors.pdf'))
 plotErrors(err_reverse_reads)
-# ggsave(paste0('plots/',whose,'_R_errors.pdf'))
+ggsave(paste0('output/miseq_R_errors.pdf'))
 
 derep_forward <- derepFastq(filtered_forward_reads, verbose=FALSE)
 derep_reverse <- derepFastq(filtered_reverse_reads, verbose=FALSE)
 
 # the sample names in these objects are initially the file names, this sets them to the sample names
-names(derep_forward) <- gsub("^.*/","", gsub("_S[0-9]*_.*$", "", filtered_forward_reads)) 
-names(derep_reverse) <- gsub("^.*/","",gsub("_S[0-9]*_.*$", "", filtered_forward_reads))
+names(derep_forward) <- samples
+names(derep_reverse) <- samples
 
 # actual DADA2 denoising step
-dada_forward <- dada(derep_forward, err=err_forward_reads, pool="pseudo", multithread=24)
-dada_reverse <- dada(derep_reverse, err=err_reverse_reads, pool="pseudo", multithread=24)
+dada_forward <- dada(derep_forward, err=err_forward_reads, pool="pseudo", multithread=16)
+dada_reverse <- dada(derep_reverse, err=err_reverse_reads, pool="pseudo", multithread=16)
 ```
 
-#### Merge and chimera cleaning
+##### Merge and chimera cleaning
+
 This step merges the denoised forward and reverse reads. The `trimOverhang` parameter is probably not relevant as that's only if your overlap is so much that your reverse goes past the start of your forward (can lead to wonky things if you read through the primer etc and pre-trimming didn't go well). 
 
 NB: `minOverlap` can make a LOT of difference in read retention. If trim lengths are `240 + 200` and biological amplicon size is `440`, you're in for a bad time. If physical amplicon size is `415`, life is especially bad bad, because biology is variable so organisms with expected or shorter amplicon sizes are great, but any organism with a single insertion in your amplicon length will get dropped. So pick a conservative number, but not too conservative that you get spurious merges :) Current primers in the lab should be amplifying something ~400, so we have a wiggle room of 38bp for merging with default parameters.
@@ -232,22 +271,52 @@ NB: `minOverlap` can make a LOT of difference in read retention. If trim lengths
 merged_amplicons <- mergePairs(dada_forward, derep_forward, dada_reverse, derep_reverse, 
                                trimOverhang=TRUE, minOverlap=12)
 seqtab_laragen <- makeSequenceTable(merged_amplicons)
+saveRDS(seqtab_laragen, "data/seqtab_laragen.rds")
 
-print("Merged fraction LARAGEN:")
+print("Merged fraction MISEQ:")
 rowSums(seqtab_laragen) / rowSums(makeSequenceTable(dada_forward))
+
+capture.output(print("Merged fraction MISEQ:"), file=logfile, append=TRUE)
+capture.output(rowSums(seqtab_laragen) / rowSums(makeSequenceTable(dada_forward)), file=logfile, append=TRUE)
+write.table(
+  rowSums(seqtab_laragen) / rowSums(makeSequenceTable(dada_forward)),
+  file='output/merged_frac_laragen.tsv', sep='\t', quote=F, row.names = T, col.names = NA
+  )
 ```
 
+### DATASET 2 - UC Davis NextSeq 2K
 
-
-## DATASET 2 - UC Davis NextSeq 2K
-### Cutadapt
+#### Cutadapt
 
 ```{bash eval=F}
-MY_FILES=$(cat nextseq_manifest.txt)  ### EDIT THIS FOR YOUR SAMPLES!! 
+MY_FILES=$(cat data/manifest_nextseq.txt)  ### EDIT THIS FOR YOUR SAMPLES!!
 
 echo -e "Today we are analyzing:\n\n$MY_FILES"
 echo ""
 mkdir -p fastq_cutadapt_2  # to make the directory where cutadapt-processed files will go
+
+### VALIDATION PASS — run this before cutadapt to catch missing files up front
+missing_r1=()
+missing_r2=()
+
+for R1 in $MY_FILES; do
+  R2=$(echo $R1 | sed 's/_R1_001.fastq.gz/_R2_001.fastq.gz/')
+  [[ -f "$R1" ]] || missing_r1+=("$R1")
+  [[ -f "$R2" ]] || missing_r2+=("$R2")
+done
+
+echo "Checked $(echo "$MY_FILES" | wc -l) manifest entries."
+echo ""
+echo "Missing R1 (${#missing_r1[@]}):"
+printf '  %s\n' "${missing_r1[@]}"
+echo ""
+echo "Missing R2 (${#missing_r2[@]}):"
+printf '  %s\n' "${missing_r2[@]}"
+
+if [[ ${#missing_r1[@]} -gt 0 || ${#missing_r2[@]} -gt 0 ]]; then
+  echo ""
+  echo ":warning: Fix the manifest or investigate these paths before proceeding."
+fi
 
 F515="GTGYCAGCMGCCGCGGTAA"
 F515_RC="TTACCGCGGCKGCTGRCAC"
@@ -257,20 +326,23 @@ R806="GGACTACNVGGGTWTCTAAT"
 R806_RC="ATTAGAWACCCBNGTAGTCC"
 
 for R1 in $MY_FILES; do 
-R2=$(echo $R1 | sed 's/_R1_/_R2_/')
+R2=$(echo $R1 | sed 's/_R1_001.fastq.gz/_R2_001.fastq.gz/')
 
 # ORPHAN 515f-926r
-#cutadapt -a ^${F515}...${R926_RC} -A ^${R926}...${F515_RC} --discard-untrimmed -m 100 -j 36 -o fastq_cutadapt_2/$(basename $R1) -p fastq_cutadapt_2/$(basename $R2) $R1 $R2
+/export/data1/sw/anaconda3-2019.07/envs/rstudio/bin/cutadapt -a ^${F515}...${R926_RC} -A ^${R926}...${F515_RC} --discard-untrimmed -m 100 -j 36 -o fastq_cutadapt_2/$(basename $R1) -p fastq_cutadapt_2/$(basename $R2) $R1 $R2
 
 # SHANA 515f-806r
-cutadapt -a ^${F515}...${R806_RC} -A ^${R806}...${F515_RC} --discard-untrimmed -m 80 -j 24 -o fastq_cutadapt_2/$(basename $R1) -p fastq_cutadapt_2/$(basename $R2) $R1 $R2
+#cutadapt -a ^${F515}...${R806_RC} -A ^${R806}...${F515_RC} --discard-untrimmed -m 80 -j 24 -o fastq_cutadapt_2/$(basename $R1) -p fastq_cutadapt_2/$(basename $R2) $R1 $R2
 
 done
 ```
 
+#### Main DADA2 workflow (NextSeq)
 
-### Reading in data
+##### Reading in data
+
 Read in data. The last `gsub` line sets the sample names by trimming off the general filename junk (`S00_L001_R2.fastq.gz`) but modify as needed if you have identical prefixes in across different libraries, etc.
+
 ```{r message=F, results='hide', warning=F, eval=F}
 library(dada2)
 library(ggplot2)
@@ -286,15 +358,17 @@ filtered_reverse_reads <- gsub("_001.fastq","_filtered.fastq", reverse_reads)
 
 # set up sample names - double check it stripped off the junk appropriately
 samples <- gsub("^.*/","",
-                gsub("_S[0-9]*_L.*$", "", filtered_forward_reads)) ## MODIFY IF NEEDED
+                gsub("_S[0-9]{1,3}_(L[0-9]{3}.*|R[12]_filtered.*)$", "", filtered_forward_reads)) ## MODIFY IF NEEDED
 print(samples)
+
+capture.output(print("NextSeq samples:"), file=logfile, append=TRUE)
+capture.output(print(samples), file=logfile, append=TRUE)
 ```
 
 Can plot a few to get an idea of what quality scores look like:
 Note that for NextSeq data, quality scores are binned so profiles will look spiky and background heatmap is extra informative.
 
-
-```{r warning=F, message=F, eval=T}
+```{r warning=F, message=F, eval=F}
 plotQualityProfile(forward_reads[1:min(2, length(forward_reads))]) + 
   geom_vline(xintercept = 240, col='black', lty=2) +
   geom_hline(yintercept = 30, col='grey60', lty=3)
@@ -303,8 +377,8 @@ plotQualityProfile(reverse_reads[1:min(2, length(forward_reads))]) +
   geom_hline(yintercept = 30, col='grey60', lty=3)
 ```
 
+##### Filter & error rates
 
-#### Filter & error rates
 Note that this step defaults to the standard Orphan lab parameters for trimming (`truncLen=`), 240bp forward / 200bp reverse. If you dislike this (or finished and are dissatisfied with the results), run the previous section to optimize this step.
 
 ```{r eval=F}
@@ -313,43 +387,43 @@ filtered_out <- filterAndTrim(forward_reads, filtered_forward_reads,
                 rm.phix=TRUE, minLen=150, truncLen=c(240,200))
 
 cbind(filtered_out, perc_kept = filtered_out[,2]/filtered_out[,1])
+capture.output(cbind(filtered_out, perc_kept = filtered_out[,2]/filtered_out[,1]), file=logfile, append=TRUE)
+write.table(
+  cbind(filtered_out, perc_kept = filtered_out[,2]/filtered_out[,1]),
+  file='output/filtered_out_nextseq.tsv', sep='\t', quote=F, row.names = T, col.names = NA
+  )
 ```
 
+##### Estimate error models & denoise (make ASVs)
 
-#### Estimate error models & denoise (make ASVs)
 Using the filtered reads generated in the last step, this next chunk will estimate the error rates from our data (default assumption is that all samples are equivalent in error profile, if this is not the case there are parameters that can be adjusted). Sequences are then dereplicated which `dada()` uses with the error model to define ASVs and discard erroneous variants. 
 
 **Note** that `binQ` variable is the binned units that Illumina's software uses for the given NextSeq run used, currently accurate as of Feb 2026 but subject to change. Confirm with the plot above (from the `plotQualityProfile`) or by manually checking the fastqs. In the plot, you are looking for the horizontal rows in the heatmap, this is a useful way to estimate what the values are, and whether you need to investigate further if `binQ` needs to be changed.
 
-
 ```{r eval=F}
 binQ <- makeBinnedQualErrfun(c(2,12,24,40))   # UPDATE AS NEEDED
-err_forward_reads <- learnErrors(filtered_forward_reads, errorEstimationFunction=binQ, multi=24)
-err_reverse_reads <- learnErrors(filtered_reverse_reads, errorEstimationFunction=binQ, multi=24)
-# plotErrors(err_forward_reads)
-# plotErrors(err_reverse_reads)
+err_forward_reads <- learnErrors(filtered_forward_reads, errorEstimationFunction=binQ, multithread=16)
+err_reverse_reads <- learnErrors(filtered_reverse_reads, errorEstimationFunction=binQ, multithread=16)
 
 plotErrors(err_forward_reads)
-ggsave(paste0('plots/',whose,'_F_errors.pdf'))
+ggsave(paste0('output/nextseq_F_errors.pdf'))
 plotErrors(err_reverse_reads)
-ggsave(paste0('plots/',whose,'_R_errors.pdf'))
-```
+ggsave(paste0('output/nextseq_R_errors.pdf'))
 
-
-```{r eval=F}
 derep_forward <- derepFastq(filtered_forward_reads, verbose=FALSE)
 derep_reverse <- derepFastq(filtered_reverse_reads, verbose=FALSE)
 
 # the sample names in these objects are initially the file names, this sets them to the sample names
-names(derep_forward) <- gsub("^.*/","", gsub("_S[0-9]*_.*$", "", filtered_forward_reads)) 
-names(derep_reverse) <- gsub("^.*/","",gsub("_S[0-9]*_.*$", "", filtered_forward_reads))
+names(derep_forward) <- samples
+names(derep_reverse) <- samples
 
 # actual DADA2 denoising step
-dada_forward <- dada(derep_forward, err=err_forward_reads, pool="pseudo", multithread=24)
-dada_reverse <- dada(derep_reverse, err=err_reverse_reads, pool="pseudo", multithread=24)
+dada_forward <- dada(derep_forward, err=err_forward_reads, pool="pseudo", multithread=16)
+dada_reverse <- dada(derep_reverse, err=err_reverse_reads, pool="pseudo", multithread=16)
 ```
 
-#### Merge and chimera cleaning
+##### Merge and chimera cleaning
+
 This step merges the denoised forward and reverse reads. The `trimOverhang` parameter is probably not relevant as that's only if your overlap is so much that your reverse goes past the start of your forward (can lead to wonky things if you read through the primer etc and pre-trimming didn't go well). 
 
 NB: `minOverlap` can make a LOT of difference in read retention. If trim lengths are `240 + 200` and biological amplicon size is `440`, you're in for a bad time. If physical amplicon size is `415`, life is especially bad bad, because biology is variable so organisms with expected or shorter amplicon sizes are great, but any organism with a single insertion in your amplicon length will get dropped. So pick a conservative number, but not too conservative that you get spurious merges :) Current primers in the lab should be amplifying something ~400, so we have a wiggle room of 38bp for merging with default parameters.
@@ -358,27 +432,26 @@ NB: `minOverlap` can make a LOT of difference in read retention. If trim lengths
 merged_amplicons <- mergePairs(dada_forward, derep_forward, dada_reverse, derep_reverse, 
                                trimOverhang=TRUE, minOverlap=12)
 seqtab_nextseq <- makeSequenceTable(merged_amplicons)
+saveRDS(seqtab_nextseq, "data/seqtab_nextseq.rds")
 
 print("Merged fraction NEXTSEQ:")
 rowSums(seqtab_nextseq) / rowSums(makeSequenceTable(dada_forward))
+
+capture.output(print("Merged fraction NEXTSEQ:"), file=logfile, append=TRUE)
+capture.output(rowSums(seqtab_nextseq) / rowSums(makeSequenceTable(dada_forward)), file=logfile, append=TRUE)
+write.table(
+  rowSums(seqtab_laragen) / rowSums(makeSequenceTable(dada_forward)),
+  file='output/merged_frac_nextseq.tsv', sep='\t', quote=F, row.names = T, col.names = NA
+  )
 ```
 
+### COMBINE
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-## COMBINE
+```{r eval=F}
+# OPTIONAL: Load previously constructed sequence tables
+seqtab_laragen <- readRDS(paste0(working_dir, "/", "data/seqtab_nextseq.rds"))
+seqtab_nextseq <- readRDS(paste0(working_dir, "/", "data/seqtab_nextseq.rds"))
+```
 
 ```{r eval=F}
 seqtab <- mergeSequenceTables(seqtab_laragen, seqtab_nextseq)
@@ -389,8 +462,8 @@ mergestats <- data.frame(laragen_asvs=ncol(seqtab_laragen),
 mergestats$overlap <-  1 - (mergestats$merged_asvs/(mergestats$laragen_asvs+mergestats$nextseq_asvs))
 ```
 
+#### Remove chimeras (bimeras)
 
-### Remove chimeras (bimeras)
 ```{r eval=F}
 seqtab.nochim <- removeBimeraDenovo(seqtab, verbose = T, method = 'consensus')
 
@@ -398,13 +471,14 @@ print("Non-chimeric fraction:")
 sum(seqtab.nochim)/sum(seqtab)
 
 mergestats$merged_nonchim <-  ncol(seqtab.nochim)
-write.table(mergestats, file='mergestats.tsv', sep='\t', quote=F, row.names = F, col.names = T)
+write.table(mergestats, file='output/mergestats.tsv', sep='\t', quote=F, row.names = F, col.names = T)
 print(mergestats)
 ```
 
+#### Summarize read retention by step
 
-### Summarize read retention by step
 Plot this summary (this makes a good supplemental figure):
+
 ```{r eval=F, message=FALSE, warning=FALSE}
 # getN <- function(x) sum(getUniques(x))
 # 
@@ -415,28 +489,28 @@ Plot this summary (this makes a good supplemental figure):
 #                final_perc_reads_retained=round(rowSums(seqtab.nochim)/filtered_out[,1]*100, 1))
 # 
 # summary_tab
-# write.table(summary_tab, "read-count-tracking.tsv", quote=FALSE, sep="\t", col.names=NA)
+# write.table(summary_tab, "output/read-count-tracking.tsv", quote=FALSE, sep="\t", col.names=NA)
 # 
 # ggplot(melt(summary_tab[,-ncol(summary_tab)], variable.name='Step', value.name='Reads'), aes(x = Step, y = Reads)) +
-# 	#geom_bar(aes(fill = Step), stat = 'identity') + 
+# 	#geom_bar(aes(fill = Step), stat = 'identity') +
 #   geom_boxplot(outlier.shape = NA) + geom_jitter(aes(color=samp), height=0, width=0.2) + guides(fill='none') +
-#   theme_bw() + theme(axis.text.x = element_text(angle = 90, color='black', hjust=1, vjust=0.5), 
+#   theme_bw() + theme(axis.text.x = element_text(angle = 90, color='black', hjust=1, vjust=0.5),
 #                      axis.line.x = element_line(), axis.line.y = element_line())
-# ggsave("read-count-tracking.pdf", width=8, height=6)
+# ggsave("output/read-count-tracking.pdf", width=8, height=6)
 # 
 # melt(summary_tab[,-ncol(summary_tab)], variable.name='Step', value.name='Reads') %>% group_by(samp) %>%
-#   mutate(Reads=Reads/Reads[Step == "input"]) %>% mutate(guess_type='sample') %>% 
+#   mutate(Reads=Reads/Reads[Step == "input"]) %>% mutate(guess_type='sample') %>%
 #   mutate(guess_type=replace(guess_type, grep("[Bb]lank|[Cc]ont[rol]*|[Nn]eg|DNAex|50cyc",samp), 'control')) %>%
 #   ggplot(aes(x = Step, y = Reads)) +
 #   geom_boxplot(aes(color = guess_type), outlier.shape = NA) + theme_bw() +
 #   geom_point(position=position_jitterdodge(jitter.height=0, jitter.width=0.2), aes(fill=guess_type), alpha=0.6, pch=21) +
 # 	theme(axis.text.x = element_text(angle = 90, color='black', hjust=1, vjust=0.5), panel.background = element_blank(),
 # 	      axis.line.x = element_line(), axis.line.y = element_line())
-# ggsave("read-count-tracking_percent.pdf", width=8, height=6)
+# ggsave("output/read-count-tracking_percent.pdf", width=8, height=6)
 ```
 
+#### Annotation
 
-### Annotation
 ```{r eval=F}
 library(DECIPHER)
 
@@ -449,10 +523,11 @@ load("/export/data1/db/16S_tag_processing_db/CABO-16S_20250911.RData")  # CABO-1
 dna <- DNAStringSet(getSequences(seqtab.nochim))
 
 ## and classify, threshold=40 means 40% confidence as some lineages would be unclassified (default 60%)
-tax_info <- IdTaxa(test=dna, trainingSet=trainingSet, strand="top", threshold=40, processors = 24)
+tax_info <- IdTaxa(test=dna, trainingSet=trainingSet, strand="top", threshold=40, processors = 16)
 ```
 
-Save the data as counts table and as fasta of ASV representative seqs (so you can do plots later)
+Save the data as counts table and as fasta of ASV representative seqs (so you can do plots later).
+
 ```{r eval=F}
  # giving our seq headers more manageable names (ASV_1, ASV_2...)
 asv_seqs <- colnames(seqtab.nochim)
@@ -464,12 +539,12 @@ for (i in 1:dim(seqtab.nochim)[2]) {
 
   # making and writing out a fasta of our final ASV seqs:
 asv_fasta <- c(rbind(asv_headers, asv_seqs))
-write(asv_fasta, "ASVs.fa")
+write(asv_fasta, "data/ASVs.fa")
 
   # count table:
 asv_tab <- t(seqtab.nochim)
 row.names(asv_tab) <- sub(">", "", asv_headers)
-write.table(asv_tab, "ASVs_counts.tsv", sep="\t", quote=F, col.names=NA)
+write.table(asv_tab, "data/ASVs_counts.tsv", sep="\t", quote=F, col.names=NA)
 
   # tax table:
   # creating table of taxonomy and setting any that are unclassified as "NA"
@@ -483,7 +558,5 @@ asv_tax <- matrix(unlist(asv_tax), ncol=length(ranks), byrow = T, dimnames = lis
 colnames(asv_tax) <- ranks
 rownames(asv_tax) <- gsub(pattern=">", replacement="", x=asv_headers)
 
-write.table(asv_tax, "ASVs_taxonomy.tsv", sep = "\t", quote=F, col.names=NA)
+write.table(asv_tax, "data/ASVs_taxonomy.tsv", sep = "\t", quote=F, col.names=NA)
 ```
-
-
